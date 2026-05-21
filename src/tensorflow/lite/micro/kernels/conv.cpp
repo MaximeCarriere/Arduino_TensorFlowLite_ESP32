@@ -27,6 +27,13 @@ limitations under the License.
 #include "tensorflow/lite/micro/kernels/kernel_util.h"
 #include "tensorflow/lite/micro/micro_error_reporter.h"
 
+#ifdef USE_ESP_NN_CONV
+#include "esp_nn.h"
+#include "esp_nn_defs.h"
+#include <esp_heap_caps.h>
+#include <cstdio>
+#endif
+
 namespace tflite {
 namespace {
 
@@ -112,6 +119,82 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
       break;
     }
     case kTfLiteInt8: {
+#ifdef USE_ESP_NN_CONV
+      // Fast path: ESP-NN optimized int8 conv for ESP32 family chips.
+      // Falls through to the reference kernel via the #else branch when
+      // USE_ESP_NN_CONV is not defined.
+      static int call_count = 0;
+      call_count++;
+      if (call_count <= 3) {
+        printf("[ESP-NN] conv2d call #%d - using fast path\n", call_count);
+      }
+
+      const auto& input_shape = tflite::micro::GetTensorShape(input);
+      const auto& filter_shape = tflite::micro::GetTensorShape(filter);
+      const auto& output_shape = tflite::micro::GetTensorShape(output);
+
+      // Tensor layout is [batch, height, width, channels].
+      const int input_height = input_shape.Dims(1);
+      const int input_width = input_shape.Dims(2);
+      const int input_depth = input_shape.Dims(3);
+      const int filter_height = filter_shape.Dims(1);
+      const int filter_width = filter_shape.Dims(2);
+      const int output_height = output_shape.Dims(1);
+      const int output_width = output_shape.Dims(2);
+      const int output_depth = output_shape.Dims(3);
+
+      data_dims_t in_dims = {input_width, input_height, input_depth, 1};
+      data_dims_t fl_dims = {filter_width, filter_height, input_depth, output_depth};
+      data_dims_t out_dims = {output_width, output_height, output_depth, 1};
+
+      const ConvParams cp_tf = ConvParamsQuantized(params, data);
+
+      conv_params_t conv_params;
+      conv_params.in_offset = cp_tf.input_offset;
+      conv_params.out_offset = cp_tf.output_offset;
+      conv_params.stride.width = params.stride_width;
+      conv_params.stride.height = params.stride_height;
+      conv_params.padding.width = cp_tf.padding_values.width;
+      conv_params.padding.height = cp_tf.padding_values.height;
+      conv_params.dilation.width = params.dilation_width_factor;
+      conv_params.dilation.height = params.dilation_height_factor;
+      conv_params.activation.min = cp_tf.quantized_activation_min;
+      conv_params.activation.max = cp_tf.quantized_activation_max;
+
+      quant_data_t quant_data;
+      quant_data.mult = const_cast<int32_t*>(data.per_channel_output_multiplier);
+      quant_data.shift = const_cast<int32_t*>(data.per_channel_output_shift);
+
+      // Scratch buffer is sized per-layer, reused across calls.
+      // Allocated in whichever heap region has space (PSRAM is fine).
+      static int8_t* scratch_buf = nullptr;
+      static int scratch_size = 0;
+      int needed = esp_nn_get_conv_scratch_size(
+          &in_dims, &fl_dims, &out_dims, &conv_params);
+      if (needed > scratch_size) {
+        if (scratch_buf) heap_caps_free(scratch_buf);
+        scratch_buf = (int8_t*)heap_caps_malloc(needed, MALLOC_CAP_8BIT);
+        scratch_size = needed;
+        if (!scratch_buf) {
+          printf("[ESP-NN] FAILED to allocate %d byte scratch buffer\n", needed);
+        } else if (call_count <= 3) {
+          printf("[ESP-NN] allocated %d byte scratch buffer at %p\n",
+                 needed, scratch_buf);
+        }
+      }
+      esp_nn_set_conv_scratch_buf(scratch_buf);
+
+      esp_nn_conv_s8(
+          &in_dims,
+          tflite::micro::GetTensorData<int8_t>(input),
+          &fl_dims,
+          tflite::micro::GetTensorData<int8_t>(filter),
+          tflite::micro::GetOptionalTensorData<int32_t>(bias),
+          &out_dims,
+          tflite::micro::GetTensorData<int8_t>(output),
+          &conv_params,
+          &quant_data);
+#else
       reference_integer_ops::ConvPerChannel(
           ConvParamsQuantized(params, data), data.per_channel_output_multiplier,
           data.per_channel_output_shift, tflite::micro::GetTensorShape(input),
@@ -122,6 +205,7 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
           tflite::micro::GetOptionalTensorData<int32_t>(bias),
           tflite::micro::GetTensorShape(output),
           tflite::micro::GetTensorData<int8_t>(output));
+#endif
       break;
     }
     default:
